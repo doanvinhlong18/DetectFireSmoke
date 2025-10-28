@@ -12,3 +12,14 @@ env/
 # IDE / Editors
 .vscode/
 .idea/
+
+# Machine learning / deep learning models
+*.h5
+*.hdf5
+*.pkl
+*.joblib
+*.pt
+*.pth
+*.onnx
+*.ckpt
+*.tflite
