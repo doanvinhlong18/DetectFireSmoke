@@ -23,4 +23,4 @@ env/
 *.onnx
 *.ckpt
 *.tflite
-datasets
+datasets/
