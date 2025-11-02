@@ -1,154 +1,196 @@
 import cv2
 import numpy as np
 import imutils
-import time
+from collections import deque
 
-# --- Tham số có thể chỉnh ---
-FIRE_MIN_AREA = 500   # diện tích tối thiểu để xem là vùng lửa
-SMOKE_MIN_AREA = 800  # diện tích tối thiểu để xem là vùng khói
-SHOW_WINDOW = True
-
-# HSV thresholds for fire (tunable)
-# Fire thường có màu vàng/đỏ cam -> H khoảng 0-50 (0..180 in OpenCV), S cao, V cao
-FIRE_LOWER = np.array([0, 120, 150])
-FIRE_UPPER = np.array([50, 255, 255])
-
-# Smoke heuristic thresholds in HSV:
-# Smoke thường ít bão hòa (S thấp), có giá trị V trung bình -> S nhỏ
-SMOKE_S_MAX = 80
-SMOKE_V_MIN = 40
-SMOKE_V_MAX = 220
-
-# Morph kernel
+# --- Params ---
+FIRE_MIN_AREA = 500
+SMOKE_MIN_AREA = 800
 KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5,5))
+FIRE_HISTORY_LEN = 8
+FIRE_HISTORY_THRESHOLD = 0.5
 
-def detect_fire(frame_hsv):
+FIRE_LOWER = np.array([0, 50, 150])
+FIRE_UPPER = np.array([60, 255, 255])
+
+# Smoke color (gray-yellow)
+SMOKE_LOWER = np.array([0, 10, 80])
+SMOKE_UPPER = np.array([70, 80, 200])
+
+# Flicker memory
+flicker = {}
+
+def update_flicker(key, v):
+    if key not in flicker:
+        flicker[key] = deque(maxlen=12)
+    flicker[key].append(v)
+
+def has_flicker(key):
+    if key not in flicker or len(flicker[key]) < 6:
+        return True
+    return np.std(flicker[key]) > 8
+
+# ================= FIRE MASK =================
+def fire_mask(frame_bgr, frame_hsv):
+    h,s,v = cv2.split(frame_hsv)
+
+    # Fire basic color
     mask = cv2.inRange(frame_hsv, FIRE_LOWER, FIRE_UPPER)
-    # Clean up
+
+    # Fire "core" = high sat + bright
+    fire_core = (s > 120) & (v > 180)
+    mask[~fire_core] = 0
+
+    # Morphology (giảm close để không ăn khói)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, KERNEL, iterations=1)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_DILATE, KERNEL, iterations=2)
+    mask = cv2.dilate(mask, KERNEL, iterations=1)
+
     return mask
 
-def detect_smoke(frame_hsv, motion_mask):
-    # Smoke: low saturation & some brightness and motion overlap
+
+# ================ SMOKE MASK =================
+def smoke_mask(frame_hsv, frame_bgr, fire_mask):
     h, s, v = cv2.split(frame_hsv)
-    # candidate where S is low and V in range
-    s_mask = (s <= SMOKE_S_MAX).astype('uint8') * 255
-    v_mask = cv2.inRange(v, SMOKE_V_MIN, SMOKE_V_MAX)
-    candidate = cv2.bitwise_and(s_mask, v_mask)
-    # morphological
-    candidate = cv2.morphologyEx(candidate, cv2.MORPH_OPEN, KERNEL, iterations=1)
-    candidate = cv2.morphologyEx(candidate, cv2.MORPH_DILATE, KERNEL, iterations=2)
-    # require motion overlap (smoke moves)
-    smoke_mask = cv2.bitwise_and(candidate, motion_mask)
-    return smoke_mask
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
 
-def main(source=0):
-    cap = cv2.VideoCapture(source)
-    if not cap.isOpened():
-        print("Không mở được nguồn video:", source)
-        return
+    # smoke: low saturation, medium brightness
+    low_sat = (s < 90)
+    mid_v = (v > 80) & (v < 235)
 
-    fgbg = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=25, detectShadows=True)
-    prev_frame = None
-    last_fire_time = 0
-    last_smoke_time = 0
+    # edges but not too strict (khói có biên mờ, không phải 0 edge)
+    edges = cv2.Canny(gray, 20, 60)
+    low_edge = (edges < 40)
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+    smoke = (low_sat & mid_v & low_edge).astype(np.uint8) * 255
 
-        frame = imutils.resize(frame, width=800)
-        frame_blur = cv2.GaussianBlur(frame, (5,5), 0)
-        frame_hsv = cv2.cvtColor(frame_blur, cv2.COLOR_BGR2HSV)
+    # remove fire
+    smoke[fire_mask > 0] = 0
 
-        # 1) Fire detection via HSV color
-        fire_mask = detect_fire(frame_hsv)
-        contours, _ = cv2.findContours(fire_mask.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        fire_boxes = []
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if area > FIRE_MIN_AREA:
-                x,y,w,h = cv2.boundingRect(cnt)
-                fire_boxes.append((x,y,w,h,area))
-                cv2.rectangle(frame, (x,y), (x+w, y+h), (0,0,255), 2)
-                cv2.putText(frame, f"FIRE {int(area)}", (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
+    # smoothing shape of smoke
+    smoke = cv2.morphologyEx(smoke, cv2.MORPH_OPEN, KERNEL, iterations=1)
+    smoke = cv2.dilate(smoke, KERNEL, iterations=2)
 
-        # 2) Motion mask (background sub)
-        fgmask = fgbg.apply(frame_blur)
-        # remove shadows (MOG2 marks shadows as 127)
-        _, fgmask = cv2.threshold(fgmask, 200, 255, cv2.THRESH_BINARY)
-        fgmask = cv2.morphologyEx(fgmask, cv2.MORPH_OPEN, KERNEL, iterations=1)
-        fgmask = cv2.morphologyEx(fgmask, cv2.MORPH_DILATE, KERNEL, iterations=2)
+    # slight blur for continuity
+    smoke = cv2.GaussianBlur(smoke, (7, 7), 0)
 
-        # 3) Smoke detection (low saturation + motion)
-        smoke_mask = detect_smoke(frame_hsv, fgmask)
-        cnts_smoke, _ = cv2.findContours(smoke_mask.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        smoke_boxes = []
-        for cnt in cnts_smoke:
-            area = cv2.contourArea(cnt)
-            if area > SMOKE_MIN_AREA:
-                x,y,w,h = cv2.boundingRect(cnt)
-                smoke_boxes.append((x,y,w,h,area))
-                cv2.rectangle(frame, (x,y), (x+w, y+h), (180,180,180), 2)
-                cv2.putText(frame, f"SMOKE {int(area)}", (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (180,180,180), 2)
+    return smoke
 
-        # 4) Optional: simple "flicker" check for fire: measure V variance in fire region
-        for (x,y,w,h,area) in fire_boxes:
-            roi = frame_hsv[y:y+h, x:x+w]
-            v = roi[:,:,2]
-            # variance of brightness: flame flicker => V variance higher
-            var_v = np.var(v)
-            if var_v > 500:  # threshold tunable
-                cv2.putText(frame, "FLAME FLICKER", (x, y+h+20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2)
+# ---------------------------------------------------
+# COMMON BOX EXTRACTOR
+# ---------------------------------------------------
+def extract_boxes(mask, frame, hsv, is_video, min_area, is_fire):
+    clean = cv2.morphologyEx(mask, cv2.MORPH_ERODE, KERNEL, iterations=1)
+    cnts,_ = cv2.findContours(clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    boxes = []
 
-        # Alerts
-        now = time.time()
-        if fire_boxes:
-            last_fire_time = now
-        if smoke_boxes:
-            last_smoke_time = now
+    for c in cnts:
+        area = cv2.contourArea(c)
+        if area < min_area: continue
 
-        if now - last_fire_time < 2:
-            cv2.putText(frame, "ALERT: FIRE DETECTED!", (10,30), cv2.FONT_HERSHEY_DUPLEX, 1.0, (0,0,255), 3)
-        if now - last_smoke_time < 2:
-            cv2.putText(frame, "ALERT: SMOKE DETECTED!", (10,70), cv2.FONT_HERSHEY_DUPLEX, 0.9, (200,200,200), 3)
+        (cx,cy),(w,h),_ = cv2.minAreaRect(c)
+        if w < 5 or h < 5: continue
 
-        # Show masks small for debugging
-        if SHOW_WINDOW:
-            small_fire = cv2.resize(fire_mask, (200,150))
-            small_smoke = cv2.resize(smoke_mask, (200,150))
-            small_fg = cv2.resize(fgmask, (200,150))
-            # Compose a little panel
-            panel = np.zeros((170, 650, 3), dtype='uint8')
-            panel[10:160, 10:210] = cv2.cvtColor(small_fire, cv2.COLOR_GRAY2BGR)
-            panel[10:160, 210+10:210+210] = cv2.cvtColor(small_smoke, cv2.COLOR_GRAY2BGR)
-            panel[10:160, 420+10:420+210] = cv2.cvtColor(small_fg, cv2.COLOR_GRAY2BGR)
-            cv2.putText(panel, "Fire mask", (20, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 1)
-            cv2.putText(panel, "Smoke mask", (230, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200,200,200), 1)
-            cv2.putText(panel, "Motion mask", (460, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 1)
+        x = int(cx - w/2)
+        y = int(cy - h/2)
+        w = int(w); h = int(h)
 
-            # show main frame and panel
-            panel = cv2.resize(panel, (frame.shape[1], panel.shape[0]))
-            combined = np.vstack([frame, panel])
-            cv2.imshow("Fire & Smoke Detection", combined)
+        roi = frame[y:y+h, x:x+w]
+        hsv_roi = hsv[y:y+h, x:x+w]
+        if roi.size == 0: continue
+
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        lap = cv2.Laplacian(gray, cv2.CV_64F).var()
+
+        if is_fire:
+            # flame color check
+            b,g,r = cv2.split(roi)
+            rgb = (r > g) & (g > b)
+            if np.mean(rgb) < 0.3: continue
+            if lap < 10: continue
+
+            if is_video:
+                key = (x,y,w,h)
+                update_flicker(key, np.mean(hsv_roi[:,:,2]))
+                if not has_flicker(key): continue
+
         else:
-            cv2.imshow("Frame", frame)
+            # smoke — low texture but gradient edges exist
+            if lap > 25: continue
 
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord('q') or key == 27:
-            break
-        elif key == ord('p'):
-            cv2.waitKey(0)  # pause on key p
+        boxes.append((x,y,w,h))
+    return boxes
 
-    cap.release()
-    cv2.destroyAllWindows()
+# ---------------------------------------------------
+def run(src):
+    is_video = not (isinstance(src,str) and src.lower().endswith((".jpg",".png",".jpeg")))
 
-if __name__ == "__main__":
+    if is_video:
+        cap = cv2.VideoCapture(0 if src=="0" else src)
+        hist = deque(maxlen=FIRE_HISTORY_LEN)
+
+        while True:
+            ret,frame=cap.read()
+            if not ret: break
+            frame = imutils.resize(frame,width=900)
+            blur = cv2.GaussianBlur(frame,(5,5),0)
+            hsv = cv2.cvtColor(blur,cv2.COLOR_BGR2HSV)
+
+            fire = fire_mask(blur,hsv)
+            smoke = smoke_mask(hsv, blur, fire)
+
+            fire_boxes  = extract_boxes(fire, frame, hsv, True,  FIRE_MIN_AREA, True)
+            smoke_boxes = extract_boxes(smoke, frame, hsv, True, SMOKE_MIN_AREA, False)
+
+            hist.append(1 if len(fire_boxes)>0 else 0)
+            stable = sum(hist)/len(hist) > FIRE_HISTORY_THRESHOLD
+
+            # draw fire
+            for x,y,w,h in fire_boxes:
+                cv2.rectangle(frame,(x,y),(x+w,y+h),(0,0,255),2)
+                cv2.putText(frame,"FIRE",(x,y-5),0,0.7,(0,0,255),2)
+
+            # draw smoke
+            for x,y,w,h in smoke_boxes:
+                cv2.rectangle(frame,(x,y),(x+w,y+h),(255,0,0),2)
+                cv2.putText(frame,"SMOKE",(x,y-5),0,0.7,(255,0,0),2)
+
+            if stable and len(fire_boxes)>0:
+                cv2.putText(frame,"🔥 FIRE ALERT!",(10,30),0,1,(0,0,255),3)
+
+            cv2.imshow("Fire+Smoke",frame)
+            cv2.imshow("Fire Mask",fire)
+            cv2.imshow("Smoke Mask",smoke)
+
+            if cv2.waitKey(1)&0xFF==ord('q'): break
+
+        cap.release()
+        cv2.destroyAllWindows()
+
+    else:
+        img = imutils.resize(cv2.imread(src), width=900)
+        blur = cv2.GaussianBlur(img,(5,5),0)
+        hsv = cv2.cvtColor(blur,cv2.COLOR_BGR2HSV)
+        fire = fire_mask(blur,hsv)
+        smoke = smoke_mask(hsv,blur, fire)
+
+        fire_boxes = extract_boxes(fire,img,hsv,False,FIRE_MIN_AREA,True)
+        smoke_boxes = extract_boxes(smoke,img,hsv,False,SMOKE_MIN_AREA,False)
+
+        for x,y,w,h in fire_boxes:
+            cv2.rectangle(img,(x,y),(x+w,y+h),(0,0,255),2)
+            cv2.putText(img,"FIRE",(x,y-5),0,0.7,(0,0,255),2)
+        for x,y,w,h in smoke_boxes:
+            cv2.rectangle(img,(x,y),(x+w,y+h),(255,0,0),2)
+            cv2.putText(img,"SMOKE",(x,y-5),0,0.7,(255,0,0),2)
+
+        cv2.imshow("Fire+Smoke",img)
+        cv2.imshow("Fire Mask",fire)
+        cv2.imshow("Smoke Mask",smoke)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+
+if __name__=="__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Fire & Smoke detection")
-    parser.add_argument('--source', type=str, default='0', help='video source: 0 for webcam or path to video file')
-    args = parser.parse_args()
-    src = 0 if args.source == '0' else args.source
-    main(src)
+    p=argparse.ArgumentParser()
+    p.add_argument("--source",default="0")
+    run(p.parse_args().source)
